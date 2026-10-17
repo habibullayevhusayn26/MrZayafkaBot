@@ -123,9 +123,9 @@ const premiumEmojis = {
   web: '<tg-emoji emoji-id="5231482153228835967">🌐</tg-emoji>'
 };
 const defaultMessages = {
-  welcome: `${premiumEmojis.welcome} Assalomu alaykum {nickname}\n\n${premiumEmojis.bot} Botni kanal yoki guruhga administrator qiling va /connect bilan ulang. Boshqarish uchun /mychats buyrug\'ini yuboring.`,
+  welcome: `${premiumEmojis.welcome} Assalomu alaykum {nickname}\n\n${premiumEmojis.bot} Botni kanal yoki guruhga administrator qilib, foydalanuvchilarni taklif qilish huquqini bering — qo\'shilish so\'rovlari avtomatik qabul qilinadi. Boshqarish uchun /mychats buyrug\'ini yuboring.`,
   subscriptionRequired: `${premiumEmojis.warning} Botdan foydalanish uchun quyidagi kanallarga obuna bo\'ling`,
-  help: `${premiumEmojis.web} Guruh uchun botni administrator qiling va guruhda /connect yuboring. Kanal uchun avval botning shaxsiy chatida /connect yuboring, berilgan 6 xonali kodni kanalda /connect 123456 ko\'rinishida yuboring. Chatlaringizni /mychats bilan boshqaring; avtomatik qabulni to\'xtatib, kutilayotgan so\'rovlarni tugma bilan tasdiqlashingiz mumkin.`
+  help: `${premiumEmojis.web} Botni kanal yoki guruhga administrator qilib, foydalanuvchilarni taklif qilish huquqini bering. Qo\'shilish so\'rovlari botning shaxsiy chatida /connect qilmasdan ham avtomatik qabul qilinadi. Chatlarni /mychats bilan boshqaring; avtomatik qabulni to\'xtatib, kutilayotgan so\'rovlarni tugma bilan tasdiqlashingiz mumkin.`
 };
 function isAdmin(ctx) {
   const telegramId = Number(ctx.from?.id);
@@ -375,6 +375,24 @@ async function hydrateSettings() {
   }
   data.settings.requiredChannels = configDocument.channels || [];
   data.settings.messages = { ...defaultMessages };
+}
+
+async function registerJoinRequestChat(chat, linkedBy) {
+  const fields = {
+    title: chat.title || chat.username || String(chat.id),
+    type: chat.type,
+    username: chat.username ? `@${chat.username}` : ''
+  };
+  if (Number.isSafeInteger(Number(linkedBy)) && linkedBy != null) {
+    fields.linkedBy = Number(linkedBy);
+  }
+  const linkedChat = await JoinRequestChat.findOneAndUpdate(
+    { chatId: chat.id },
+    { $set: fields, $setOnInsert: { paused: false } },
+    { upsert: true, setDefaultsOnInsert: true, returnDocument: 'after' }
+  ).lean();
+  joinRequestChatIds.add(String(chat.id));
+  return linkedChat;
 }
 
 async function ensureUser(ctx) {
@@ -628,24 +646,21 @@ bot.on('channel_post', handleChannelLinkCommand);
 
 bot.on('my_chat_member', async (ctx) => {
   const update = ctx.myChatMember;
-  const chatId = update?.chat.id;
-  if (!chatId || !joinRequestChatIds.has(String(chatId))) return;
-
+  const chat = update?.chat;
+  if (!chat) return;
   const member = update.new_chat_member;
-  const linkedChat = await JoinRequestChat.findOne({ chatId }).lean();
-  if (!linkedChat) {
-    joinRequestChatIds.delete(String(chatId));
+  const canApproveRequests = member.status === 'creator' ||
+    (member.status === 'administrator' && member.can_invite_users === true);
+  if (canApproveRequests) {
+    await registerJoinRequestChat(chat, update.from?.id);
     return;
   }
-  const hasRequiredRights = member.status === 'creator' ||
-    (member.status === 'administrator' &&
-      member.can_invite_users === true &&
-      member.can_delete_messages === true);
-  if (hasRequiredRights) return;
 
-  await JoinRequestChat.deleteOne({ chatId });
-  joinRequestChatIds.delete(String(chatId));
-  console.warn(`Join-request processing disabled for chat ${chatId}: bot lost administrator invite or delete permission.`);
+  const linkedChat = await JoinRequestChat.findOne({ chatId: chat.id }).lean();
+  if (!linkedChat) return;
+  await JoinRequestChat.deleteOne({ chatId: chat.id });
+  joinRequestChatIds.delete(String(chat.id));
+  console.warn(`Join-request processing disabled for chat ${chat.id}: bot lost administrator invite permission.`);
 });
 
 bot.action('admin:join_chats', async (ctx) => {
@@ -933,7 +948,7 @@ bot.on('chat_join_request', async (ctx) => {
   let approvalAttempted = false;
 
   try {
-    const linkedChat = await JoinRequestChat.findOne(
+    let linkedChat = await JoinRequestChat.findOne(
       { chatId: request.chat.id },
       {
         paused: 1,
@@ -946,6 +961,12 @@ bot.on('chat_join_request', async (ctx) => {
         welcomeButtons: 1
       }
     ).lean();
+    if (!linkedChat) {
+      const botMember = await ctx.telegram.getChatMember(request.chat.id, ctx.botInfo.id);
+      const canApproveRequests = botMember.status === 'creator' ||
+        (botMember.status === 'administrator' && botMember.can_invite_users === true);
+      if (canApproveRequests) linkedChat = await registerJoinRequestChat(request.chat);
+    }
     if (!linkedChat) return;
 
     const requestFields = {
